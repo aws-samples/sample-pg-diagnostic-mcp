@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'pg-diagnose-mcp: PostgreSQL Diagnostic MCP Server for AWS DevOps Agent'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the RDS instances are located
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets in AgentCore-supported AZs (us-east-1b, 1c, 1d). Must be in the same VPC.
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group of the RDS instance(s) to allow inbound from MCP server
+  EcrRepositoryName:
+    Type: String
+    Default: pg-diagnose-mcp
+    Description: ECR repository name for the MCP server container
+  OAuthClientId:
+    Type: String
+    Default: devops-agent-client
+    Description: OAuth client ID for DevOps Agent authentication
+  OAuthClientSecret:
+    Type: String
+    NoEcho: true
+    Description: OAuth client secret for DevOps Agent authentication (stored in Secrets Manager)
+
+Resources:
+  # ── Security Group ──────────────────────────────────────────────────────
+  McpSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: pg-diagnose-mcp - AgentCore and Lambda to RDS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt McpSecurityGroup.GroupId
+          Description: VPC endpoints HTTPS
+      Tags:
+        - Key: Name
+          Value: pg-diagnose-mcp
+        - Key: auto-delete
+          Value: 'no'
+
+  RdsIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt McpSecurityGroup.GroupId
+      Description: pg-diagnose-mcp to RDS
+
+  # ── VPC Endpoints ───────────────────────────────────────────────────────
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !GetAtt VpcRouteTable.RouteTableId
+
+  VpcRouteTable:
+    Type: Custom::RouteTableLookup
+    DeletionPolicy: Retain
+    Properties:
+      ServiceToken: !GetAtt RouteTableLookupFunction.Arn
+      VpcId: !Ref VpcId
+
+  RouteTableLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt RouteTableLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, cfnresponse
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            ec2 = boto3.client('ec2')
+            rts = ec2.describe_route_tables(Filters=[{'Name':'vpc-id','Values':[event['ResourceProperties']['VpcId']]},{'Name':'association.main','Values':['true']}])
+            rt_id = rts['RouteTables'][0]['RouteTableId']
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {'RouteTableId': rt_id}, rt_id)
+
+  RouteTableLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeRouteTables
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeRouteTables
+                Resource: '*'
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt McpSecurityGroup.GroupId]
+      PrivateDnsEnabled: true
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt McpSecurityGroup.GroupId]
+      PrivateDnsEnabled: true
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt McpSecurityGroup.GroupId]
+      PrivateDnsEnabled: true
+
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt McpSecurityGroup.GroupId]
+      PrivateDnsEnabled: true
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt McpSecurityGroup.GroupId]
+      PrivateDnsEnabled: true
+
+  # ── Secrets Manager: OAuth Secret ───────────────────────────────────────
+  OAuthSecretResource:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: pg-diagnose-mcp/oauth-client-secret
+      Description: OAuth client secret for pg-diagnose-mcp DevOps Agent authentication
+      SecretString: !Ref OAuthClientSecret
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+
+  # ── Secrets Manager: Database ARN Registry ──────────────────────────────
+  DatabaseRegistry:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: pg-diagnose-mcp/registry
+      Description: ARN allowlist of database secrets for pg-diagnose-mcp
+      SecretString: '{"allowed_arns": []}'
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+
+  # ── ECR Repository ──────────────────────────────────────────────────────
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+
+  # ── IAM Roles ───────────────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pg-diagnose-mcp-lambda-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeAgentCore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+        - PolicyName: ReadOAuthSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OAuthSecretResource
+
+  # ── Lambda Function ─────────────────────────────────────────────────────
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pg-diagnose-mcp-proxy
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 90
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          RUNTIME_ARN: PLACEHOLDER_UPDATE_AFTER_AGENTCORE_DEPLOY
+          BASE_URL: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com
+          OAUTH_CLIENT_ID: !Ref OAuthClientId
+          OAUTH_SECRET_ARN: !Ref OAuthSecretResource
+          TOKEN_TTL_SECONDS: '3600'
+      Code:
+        ZipFile: |
+          # Placeholder — deploy real code with: aws lambda update-function-code
+          def handler(event, context):
+            return {"statusCode": 503, "body": "Deploy lambda-proxy/index.py first"}
+      Tags:
+        auto-delete: 'no'
+
+  # ── API Gateway ─────────────────────────────────────────────────────────
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: pg-diagnose-mcp
+      ProtocolType: HTTP
+      Tags:
+        auto-delete: 'no'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !GetAtt LambdaFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteMcpPost:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: POST /mcp
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteMcpGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /mcp
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteMcpProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /mcp/{proxy+}
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteWellKnown:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /.well-known/{proxy+}
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteOAuthResource:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /mcp/.well-known/oauth-protected-resource
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteDefault:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: $default
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: $default
+      AutoDeploy: true
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*
+
+Outputs:
+  McpEndpoint:
+    Description: MCP server endpoint URL (use for DevOps Agent registration)
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/mcp
+
+  TokenEndpoint:
+    Description: OAuth token endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/token
+
+  ApiGatewayId:
+    Description: API Gateway ID
+    Value: !Ref ApiGateway
+
+  ApiGatewayUrl:
+    Description: API Gateway base URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com
+
+  LambdaFunctionName:
+    Description: Lambda function name (deploy real code here)
+    Value: !Ref LambdaFunction
+
+  SecurityGroupId:
+    Description: Security group for AgentCore VPC mode
+    Value: !GetAtt McpSecurityGroup.GroupId
+
+  EcrRepositoryUri:
+    Description: ECR repository URI for AgentCore container
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}
+
+  NextSteps:
+    Description: Post-deployment steps
+    Value: |
+      1. Deploy AgentCore: cd mcp-server && agentcore configure && agentcore deploy
+      2. Update Lambda RUNTIME_ARN env var with AgentCore ARN
+      3. Deploy Lambda code: cd lambda-proxy && zip proxy.zip index.py && aws lambda update-function-code --function-name pg-diagnose-mcp-proxy --zip-file fileb://proxy.zip
+      4. Add databases: scripts/add-database.sh <name> --host <host> --username <user> --password <pass>
+      5. Test: scripts/test-mcp.sh <api-url> <client-id> <client-secret>
+      6. Register with DevOps Agent: aws devops-agent register-service ...

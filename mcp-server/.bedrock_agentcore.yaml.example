@@ -1,0 +1,68 @@
+default_agent: pg_diagnose_mcp_v2
+agents:
+  pg_diagnose_mcp_v2:
+    name: pg_diagnose_mcp_v2
+    language: python
+    node_version: '20'
+    entrypoint: server.py
+    deployment_type: container
+    runtime_type: null
+    platform: linux/arm64
+    container_runtime: none
+    source_path: /Users/aduenasn/Documents/Code/Kiro/projects/pg-diagnose-mcp/mcp-server
+    aws:
+      execution_role: arn:aws:iam::851725288961:role/AmazonBedrockAgentCoreSDKRuntime-us-east-1-e76be8f87f
+      execution_role_auto_create: false
+      account: '851725288961'
+      region: us-east-1
+      ecr_repository: 851725288961.dkr.ecr.us-east-1.amazonaws.com/pg-diagnose-mcp-v2
+      ecr_auto_create: false
+      s3_path: null
+      s3_auto_create: false
+      network_configuration:
+        network_mode: VPC
+        network_mode_config:
+          security_groups:
+          - sg-05b5a31b0f3a0963f
+          subnets:
+          - subnet-0bf941725a7306b8e
+          - subnet-0a1937042d9b6eaa6
+          - subnet-06793503e634db02d
+      protocol_configuration:
+        server_protocol: MCP
+      observability:
+        enabled: true
+      lifecycle_configuration:
+        idle_runtime_session_timeout: null
+        max_lifetime: null
+    bedrock_agentcore:
+      agent_id: pg_diagnose_mcp_v2-4zo7LiBRE6
+      agent_arn: arn:aws:bedrock-agentcore:us-east-1:851725288961:runtime/pg_diagnose_mcp_v2-4zo7LiBRE6
+      agent_session_id: null
+    codebuild:
+      project_name: bedrock-agentcore-pg_diagnose_mcp_v2-builder
+      execution_role: arn:aws:iam::851725288961:role/AmazonBedrockAgentCoreSDKCodeBuild-us-east-1-e76be8f87f
+      source_bucket: bedrock-agentcore-codebuild-sources-851725288961-us-east-1
+    memory:
+      mode: STM_ONLY
+      memory_id: pg_diagnose_mcp_v2_mem-tnP93HA107
+      memory_arn: arn:aws:bedrock-agentcore:us-east-1:851725288961:memory/pg_diagnose_mcp_v2_mem-tnP93HA107
+      memory_name: pg_diagnose_mcp_v2_mem
+      event_expiry_days: 30
+      first_invoke_memory_check_done: true
+      was_created_by_toolkit: true
+    identity:
+      credential_providers: []
+      workload: null
+    aws_jwt:
+      enabled: false
+      audiences: []
+      signing_algorithm: ES384
+      issuer_url: null
+      duration_seconds: 300
+    authorizer_configuration: null
+    request_header_configuration: null
+    oauth_configuration: null
+    api_key_env_var_name: null
+    api_key_credential_provider_name: null
+    is_generated_by_agentcore_create: false

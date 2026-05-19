@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+mcp-server/.bedrock_agentcore/
+mcp-server/.bedrock_agentcore.yaml
+lambda-proxy/proxy.zip

@@ -1,0 +1,8 @@
+[
+  {"ParameterKey": "VpcId", "ParameterValue": "vpc-xxxxxxxxx"},
+  {"ParameterKey": "SubnetIds", "ParameterValue": "subnet-aaa,subnet-bbb,subnet-ccc"},
+  {"ParameterKey": "RdsSecurityGroupId", "ParameterValue": "sg-xxxxxxxxx"},
+  {"ParameterKey": "OAuthClientId", "ParameterValue": "devops-agent-client"},
+  {"ParameterKey": "OAuthClientSecret", "ParameterValue": "CHANGE-ME-strong-secret-here"},
+  {"ParameterKey": "EcrRepositoryName", "ParameterValue": "pg-diagnose-mcp"}
+]
