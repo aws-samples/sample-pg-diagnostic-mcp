@@ -145,6 +145,7 @@ TOOLS = [
     {"name": "get_connection_breakdown", "description": "Connection analysis: by state, user, app, client. Identifies pool pressure.", "inputSchema": {"type": "object", "properties": {**_DB_PARAM}}},
     {"name": "get_autovacuum_workers_status", "description": "Autovacuum worker activity: which tables, progress, all slots busy?", "inputSchema": {"type": "object", "properties": {**_DB_PARAM}}},
     {"name": "generate_diagnosis_report", "description": "Evidence-based summary combining multiple diagnostic checks.", "inputSchema": {"type": "object", "properties": {**_DB_PARAM, "incident_context": {"type": "string", "description": "Problem description"}}, "required": ["incident_context"]}},
+    {"name": "get_catalog_invalidation_risk", "description": "Detect RELCACHE invalidation storms: frequent DDL (ALTER/CREATE/DROP TABLE) from pg_stat_statements that cause mass query re-planning on replicas. Identifies no-op DDL patterns, DDL frequency per hour, and correlates with replica wait events. Use when investigating periodic CPU spikes on read replicas or unexplained re-planning storms.", "inputSchema": {"type": "object", "properties": {**_DB_PARAM}}},
 ]
 
 INIT_RESULT = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "pg-diagnose-mcp", "version": "1.0.0"}}
@@ -440,6 +441,107 @@ def generate_diagnosis_report(args):
     issues.extend(conns.get("issues", []))
     if av.get("all_slots_busy"): issues.append("All autovacuum slots busy")
     return {"database": db, "executive_summary": f"Diagnosis for: {ctx}", "severity": perf.get("severity", "unknown"), "issues_found": issues, "evidence": {"performance": perf, "sessions": sessions, "waits": waits, "config": config, "system": system, "autovacuum": av, "connections": conns}, "requires_human_approval": ["VACUUM FULL", "Index creation on large tables", "Config changes requiring restart", "Killing sessions"]}
+
+
+# ── Catalog Invalidation Detection ──────────────────────────────────────────
+def get_catalog_invalidation_risk(args):
+    db = _resolve_db(args)
+    q = lambda sql, p=None: _q(db, sql, p)
+    result = {"database": db, "risk_level": "low", "findings": [], "recommendations": []}
+
+    # 1. Frequent DDL from pg_stat_statements
+    try:
+        ddl = q("""
+            SELECT query, calls, total_exec_time, mean_exec_time, rows,
+                   calls / GREATEST(EXTRACT(EPOCH FROM (now() - s.stats_reset))/3600, 1) as calls_per_hour
+            FROM pg_stat_statements ss
+            CROSS JOIN pg_stat_statements_info s
+            WHERE query ~* '^\\s*(ALTER|CREATE|DROP)\\s+(TABLE|INDEX|TYPE|SCHEMA|SEQUENCE)'
+            ORDER BY calls DESC
+            LIMIT 15
+        """)
+    except:
+        try:
+            ddl = q("""
+                SELECT query, calls, total_exec_time, mean_exec_time, rows
+                FROM pg_stat_statements
+                WHERE query ~* '^\\s*(ALTER|CREATE|DROP)\\s+(TABLE|INDEX|TYPE|SCHEMA|SEQUENCE)'
+                ORDER BY calls DESC
+                LIMIT 15
+            """)
+        except:
+            ddl = []
+            result["findings"].append({"check": "ddl_frequency", "error": "pg_stat_statements not available"})
+
+    if ddl:
+        high_freq_ddl = [d for d in ddl if int(d.get("calls", 0)) > 100]
+        result["findings"].append({"check": "ddl_frequency", "data": ddl, "high_frequency_count": len(high_freq_ddl)})
+        if high_freq_ddl:
+            result["risk_level"] = "high"
+            result["recommendations"].append("High-frequency DDL detected. ALTER TABLE invalidates RELCACHE even if no actual change occurs (no-op). This forces query re-planning on all sessions and propagates to replicas via WAL.")
+
+    # 2. No-op DDL: ALTER TABLE with 0 rows affected but high calls
+    noop_ddl = [d for d in (ddl or []) if 'ALTER' in d.get("query", "").upper() and int(d.get("rows", 0)) == 0 and int(d.get("calls", 0)) > 50]
+    if noop_ddl:
+        result["findings"].append({"check": "noop_alter_table", "data": noop_ddl})
+        result["risk_level"] = "high"
+        result["recommendations"].append("No-op ALTER TABLE detected (high calls, 0 rows affected). These invalidate RELCACHE without changing table structure, causing periodic re-planning storms on replicas.")
+
+    # 3. Current wait events suggesting re-planning pressure
+    try:
+        waits = q("""
+            SELECT wait_event_type, wait_event, count(*) as session_count
+            FROM pg_stat_activity
+            WHERE state = 'active' AND wait_event IS NOT NULL
+            GROUP BY wait_event_type, wait_event
+            ORDER BY session_count DESC
+            LIMIT 10
+        """)
+        relcache_waits = [w for w in (waits or []) if w.get("wait_event_type", "") in ('Lock', 'LWLock')]
+        result["findings"].append({"check": "current_wait_events", "data": waits, "lock_related_count": len(relcache_waits)})
+    except:
+        pass
+
+    # 4. SLRU stats (PG 13+) — shared invalidation message pressure
+    try:
+        slru = q("""
+            SELECT name, blks_zeroed, blks_hit, blks_read, blks_written, blks_exists, flushes, truncates
+            FROM pg_stat_slru
+            WHERE name IN ('notify', 'pg_serial', 'subtrans', 'multixact_offset', 'multixact_member')
+        """)
+        result["findings"].append({"check": "slru_stats", "data": slru})
+    except:
+        result["findings"].append({"check": "slru_stats", "note": "pg_stat_slru not available (requires PG 13+)"})
+
+    # 5. Replication context: is this a replica receiving invalidations?
+    try:
+        replica_info = q("SELECT pg_is_in_recovery() as is_replica, (SELECT count(*) FROM pg_stat_wal_receiver) as wal_receivers")
+        result["findings"].append({"check": "replication_role", "data": replica_info})
+        if replica_info and replica_info[0].get("is_replica"):
+            result["recommendations"].append("This is a replica. RELCACHE invalidations from DDL on the primary propagate via WAL replay and force re-planning here. Check the primary for frequent DDL.")
+    except:
+        pass
+
+    # 6. Tables with very frequent autoanalyze (DDL triggers stats invalidation)
+    try:
+        recent_ddl_tables = q("""
+            SELECT schemaname, relname, n_live_tup,
+                   last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE last_autoanalyze > now() - interval '1 hour'
+            ORDER BY last_autoanalyze DESC
+            LIMIT 10
+        """)
+        if recent_ddl_tables:
+            result["findings"].append({"check": "recently_analyzed_tables", "data": recent_ddl_tables, "note": "Tables with very recent autoanalyze may indicate DDL-triggered stats invalidation"})
+    except:
+        pass
+
+    # Summary
+    if result["risk_level"] == "low":
+        result["recommendations"].append("No significant DDL frequency detected. RELCACHE invalidation risk is low.")
+
+    return result
 
 
 # ── Dispatch + MCP Handler ──────────────────────────────────────────────────

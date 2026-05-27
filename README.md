@@ -1,6 +1,6 @@
 # pg-diagnose-mcp
 
-A PostgreSQL diagnostic MCP server for [AWS DevOps Agent](https://docs.aws.amazon.com/devopsagent/). Provides 15 read-only troubleshooting tools that give the AI agent direct access to PostgreSQL system views for automated incident investigation.
+A PostgreSQL diagnostic MCP server for [AWS DevOps Agent](https://docs.aws.amazon.com/devopsagent/). Provides 16 read-only troubleshooting tools that give the AI agent direct access to PostgreSQL system views for automated incident investigation.
 
 **No generic SQL execution.** Purpose-built diagnostic tools collect structured evidence — the AI agent explains root causes and recommends actions.
 
@@ -8,7 +8,7 @@ A PostgreSQL diagnostic MCP server for [AWS DevOps Agent](https://docs.aws.amazo
 
 ## Features
 
-- **15 diagnostic tools** — from broad health checks to deep autovacuum analysis
+- **16 diagnostic tools** — from broad health checks to deep autovacuum and catalog invalidation analysis
 - **Multi-database** — manage multiple PostgreSQL instances (RDS, Aurora, EC2) from one MCP server
 - **Tag-based discovery** — add/remove databases by tagging Secrets Manager secrets, no redeployment needed
 - **PostgreSQL 14-17 compatible** — auto-detects PG version and uses correct system views
@@ -30,7 +30,7 @@ DevOps Agent → API Gateway (OAuth) → Lambda (proxy) → AgentCore (VPC) → 
 | **API Gateway** | HTTPS endpoint with OAuth 2.0 discovery |
 | **Lambda** | OAuth credential validation + AgentCore forwarding |
 | **AgentCore** | Managed container runtime in VPC mode |
-| **MCP Server** | Python container with 15 diagnostic tools |
+| **MCP Server** | Python container with 16 diagnostic tools |
 | **Secrets Manager** | Database credentials, discovered by tag |
 | **VPC Endpoints** | S3, ECR, CloudWatch Logs, STS, Secrets Manager |
 
@@ -128,7 +128,7 @@ aws devops-agent register-service --name pg-diagnose-mcp --service mcpserver \
   --service-details '{"mcpserver":{"name":"pg-diagnose-mcp","endpoint":"https://<api-id>.execute-api.us-east-1.amazonaws.com/mcp","description":"PostgreSQL diagnostic MCP server","authorizationConfig":{"oAuthClientCredentials":{"clientName":"devops-agent","clientId":"devops-agent-client","clientSecret":"YOUR_SECRET","exchangeUrl":"https://<api-id>.execute-api.us-east-1.amazonaws.com/token","scopes":["mcp"]}}}}'
 
 aws devops-agent associate-service --agent-space-id <SPACE_ID> --service-id <SERVICE_ID> \
-  --configuration '{"mcpserver":{"tools":["list_databases","diagnose_database_performance","analyze_specific_query","get_query_plan_safe","get_top_query_workload","get_active_sessions_and_locks","get_wait_event_analysis","get_table_health","get_index_health","get_vacuum_and_stats_health","get_database_configuration","get_system_health","get_connection_breakdown","get_autovacuum_workers_status","generate_diagnosis_report"]}}'
+  --configuration '{"mcpserver":{"tools":["list_databases","diagnose_database_performance","analyze_specific_query","get_query_plan_safe","get_top_query_workload","get_active_sessions_and_locks","get_wait_event_analysis","get_table_health","get_index_health","get_vacuum_and_stats_health","get_database_configuration","get_system_health","get_connection_breakdown","get_autovacuum_workers_status","generate_diagnosis_report","get_catalog_invalidation_risk"]}}'
 ```
 
 ## Managing Databases
@@ -165,6 +165,7 @@ Databases are discovered by Secrets Manager tag `mcp-server=pg-diagnose`. The MC
 | `get_connection_breakdown` | Connections by state/user/app, utilization percentage |
 | `get_autovacuum_workers_status` | Active workers, progress, all slots busy? |
 | `generate_diagnosis_report` | Evidence-based summary combining multiple checks |
+| `get_catalog_invalidation_risk` | Detect RELCACHE invalidation storms from frequent DDL (ALTER TABLE) causing replica CPU spikes |
 
 All tools accept an optional `database` parameter. If omitted and only one database is registered, it's used automatically.
 
